@@ -50,12 +50,14 @@ DL = DOWNLOAD = b'\x04'
 META_VALUES = (EMPTY_META, SE, FI, TR, DL)
 
 # Multipart request frames
-Frames = namedtuple('Frames', ['action', 'mappings', 'stream'])
+Frames = namedtuple('Frames', ['id', 'action', 'mappings', 'stream'])
 
 
-def create_error_response(message, *args, **kwargs):
+def create_error_response(rid, message, *args, **kwargs):
     """Create a new multipart error response.
 
+    :param rid: Request ID.
+    :type rid: bytes
     :param message: Error message.
     :type message: str
 
@@ -67,7 +69,7 @@ def create_error_response(message, *args, **kwargs):
     if args or kwargs:
         message = message.format(*args, **kwargs)
 
-    return [EMPTY_META, pack(ErrorPayload.new(message).entity())]
+    return [rid, EMPTY_META, pack(ErrorPayload.new(message).entity())]
 
 
 class ComponentServer(object):
@@ -238,13 +240,7 @@ class ComponentServer(object):
 
         return payload
 
-    def __process_request_stream(self, stream):
-        try:
-            frames = Frames(*stream)
-        except:
-            LOG.error('Received an invalid multipart stream')
-            return create_error_response('Failed to handle request')
-
+    def __process_request_frames(self, frames):
         # Update global schema registry when mappings are sent
         if frames.mappings:
             self.__update_schema_registry(frames.mappings)
@@ -254,6 +250,7 @@ class ComponentServer(object):
         if action not in self.callbacks:
             # Return an error when action doesn't exist
             return create_error_response(
+                frames.id,
                 'Invalid action for component {}: "{}"',
                 self.component_title,
                 action,
@@ -264,16 +261,29 @@ class ComponentServer(object):
             payload = unpack(frames.stream)
         except:
             LOG.exception('Received an invalid message format')
-            return create_error_response('Internal communication failed')
+            return create_error_response(
+                frames.id,
+                'Internal communication failed',
+                )
 
         payload = self.__process_request_payload(action, payload)
-        return [self.get_response_meta(payload) or EMPTY_META, pack(payload)]
+        return [
+            frames.id,
+            self.get_response_meta(payload) or EMPTY_META,
+            pack(payload),
+            ]
 
     def __process_request(self, stream, pid, timeout):
+        try:
+            frames = Frames(*stream)
+        except:
+            LOG.error('Received an invalid multipart stream')
+            return create_error_response('-', 'Failed to handle request')
+
         # Process request and get response stream.
         # Request are processed inside a thread pool to avoid
         # userland code to block requests.
-        res = self._pool.spawn(self.__process_request_stream, stream)
+        res = self._pool.spawn(self.__process_request_frames, frames)
 
         # Wait for a period of seconds to get the execution result
         try:
@@ -283,11 +293,14 @@ class ComponentServer(object):
                 int(timeout * 1000),
                 pid,
                 )
-            response = create_error_response(msg)
+            response = create_error_response(frames.id, msg)
             LOG.warn('{}. PID: {}'.format(msg, pid))
         except:
             LOG.exception('Failed to handle request. PID: %d', pid)
-            response = create_error_response('Failed to handle request')
+            response = create_error_response(
+                frames.id,
+                'Failed to handle request',
+                )
 
         self._send_response(response)
 
